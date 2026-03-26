@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+from datetime import timedelta
+import re
+from urllib.parse import urlencode
+
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, joinedload
+
+from app.config import get_settings
+from app.db import Base, engine, get_db
+from app.models import RecipientProfile, Shipment, TrackingEvent, utcnow
+from app.services.carriers import (
+    CarrierConfigurationError,
+    CarrierRequestError,
+    official_tracking_url,
+    sync_shipment_tracking,
+)
+
+settings = get_settings()
+app = FastAPI(title=settings.app_name)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
+TRACKING_RE = re.compile(r"^[A-Za-z0-9-]{8,34}$")
+ARCHIVE_AFTER_DAYS = 10
+
+
+def shipment_is_archived(shipment: Shipment) -> bool:
+    status = (shipment.status or "").lower()
+    if "deliver" not in status:
+        return False
+    cutoff = utcnow() - timedelta(days=ARCHIVE_AFTER_DAYS)
+    reference_time = shipment.last_event_at or shipment.updated_at or shipment.created_at
+    return bool(reference_time and reference_time <= cutoff)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+def dashboard_redirect(message: str, tab: str = "active", edit_id: int | None = None) -> RedirectResponse:
+    params: dict[str, str] = {"message": message, "tab": "archive" if tab == "archive" else "active"}
+    if edit_id is not None:
+        params["edit_id"] = str(edit_id)
+    return RedirectResponse(url=f"/?{urlencode(params)}", status_code=303)
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(
+    request: Request,
+    db: Session = Depends(get_db),
+    message: str | None = None,
+    tab: str = "active",
+    edit_id: int | None = None,
+):
+    all_shipments = list(
+        db.scalars(
+            select(Shipment)
+            .options(joinedload(Shipment.recipient), joinedload(Shipment.events))
+            .where(Shipment.carrier == "USPS")
+            .order_by(Shipment.updated_at.desc())
+            .limit(250)
+        ).unique()
+    )
+
+    archived_shipments = [shipment for shipment in all_shipments if shipment_is_archived(shipment)]
+    active_shipments = [shipment for shipment in all_shipments if not shipment_is_archived(shipment)]
+    active_tab = "archive" if tab == "archive" else "active"
+    visible_shipments = archived_shipments if active_tab == "archive" else active_shipments
+
+    editing_shipment = db.get(Shipment, edit_id) if edit_id else None
+
+    metrics = {
+        "shipment_count": db.scalar(select(func.count(Shipment.id))) or 0,
+        "recipient_count": db.scalar(select(func.count(RecipientProfile.id))) or 0,
+        "event_count": db.scalar(select(func.count(TrackingEvent.id))) or 0,
+        "stale_shipments": db.scalar(
+            select(func.count(Shipment.id)).where(
+                Shipment.last_synced_at.is_(None)
+                | (Shipment.last_synced_at < utcnow() - timedelta(minutes=settings.tracking_refresh_minutes))
+            )
+        )
+        or 0,
+        "archived_count": len(archived_shipments),
+        "active_count": len(active_shipments),
+    }
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "request": request,
+            "message": message,
+            "shipments": visible_shipments,
+            "metrics": metrics,
+            "settings": settings,
+            "active_tab": active_tab,
+            "archive_after_days": ARCHIVE_AFTER_DAYS,
+            "editing_shipment": editing_shipment,
+        },
+    )
+
+
+@app.post("/shipments")
+def create_shipment(
+    tracking_number: str = Form(...),
+    name: str = Form(""),
+    sync_now: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    normalized_tracking = tracking_number.strip().replace(" ", "")
+    if not TRACKING_RE.match(normalized_tracking):
+        return dashboard_redirect("Tracking number format looks invalid")
+
+    normalized_carrier = "USPS"
+
+    existing = db.scalar(
+        select(Shipment).where(
+            Shipment.tracking_number == normalized_tracking,
+            Shipment.carrier == normalized_carrier,
+        )
+    )
+    if existing:
+        return dashboard_redirect("Tracking number already exists")
+
+    shipment = Shipment(
+        tracking_number=normalized_tracking,
+        carrier=normalized_carrier,
+        reference=name.strip() or None,
+        official_tracking_url=official_tracking_url(normalized_carrier, normalized_tracking),
+    )
+    db.add(shipment)
+    db.commit()
+    db.refresh(shipment)
+
+    message = "Shipment created"
+    if sync_now:
+        try:
+            sync_shipment_tracking(db, shipment)
+            db.commit()
+            message = "Shipment created and synced"
+        except CarrierConfigurationError:
+            db.commit()
+            message = "Shipment saved. Configure USPS credentials to sync live tracking"
+        except CarrierRequestError as exc:
+            db.commit()
+            message = f"Shipment saved. USPS sync failed: {str(exc)[:120]}"
+
+    return dashboard_redirect(message)
+
+
+@app.post("/shipments/{shipment_id}/edit")
+def update_shipment(
+    shipment_id: int,
+    name: str = Form(""),
+    tracking_number: str = Form(...),
+    tab: str = Form("active"),
+    db: Session = Depends(get_db),
+):
+    shipment = db.get(Shipment, shipment_id)
+    if not shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found")
+
+    normalized_tracking = tracking_number.strip().replace(" ", "")
+    if not TRACKING_RE.match(normalized_tracking):
+        return dashboard_redirect("Tracking number format looks invalid", tab=tab, edit_id=shipment_id)
+
+    normalized_carrier = "USPS"
+
+    duplicate = db.scalar(
+        select(Shipment).where(
+            Shipment.tracking_number == normalized_tracking,
+            Shipment.carrier == normalized_carrier,
+            Shipment.id != shipment_id,
+        )
+    )
+    if duplicate:
+        return dashboard_redirect("Tracking number already exists", tab=tab, edit_id=shipment_id)
+
+    shipment.reference = name.strip() or None
+    shipment.tracking_number = normalized_tracking
+    shipment.carrier = normalized_carrier
+    shipment.official_tracking_url = official_tracking_url(normalized_carrier, normalized_tracking)
+    db.add(shipment)
+    db.commit()
+    return dashboard_redirect("Shipment updated", tab=tab)
+
+
+@app.post("/shipments/{shipment_id}/delete")
+def delete_shipment(
+    shipment_id: int,
+    tab: str = Form("active"),
+    db: Session = Depends(get_db),
+):
+    shipment = db.get(Shipment, shipment_id)
+    if not shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found")
+    db.delete(shipment)
+    db.commit()
+    return dashboard_redirect("Shipment deleted", tab=tab)
+
+
+@app.post("/shipments/{shipment_id}/refresh")
+def refresh_shipment(
+    shipment_id: int,
+    tab: str = Form("active"),
+    db: Session = Depends(get_db),
+):
+    shipment = db.get(Shipment, shipment_id)
+    if not shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found")
+
+    try:
+        sync_shipment_tracking(db, shipment)
+        db.commit()
+        message = "Shipment refreshed"
+    except CarrierConfigurationError:
+        db.rollback()
+        message = "USPS credentials are missing"
+    except CarrierRequestError as exc:
+        db.rollback()
+        message = f"USPS refresh failed: {str(exc)[:120]}"
+    return dashboard_redirect(message, tab=tab)
+
+
+@app.post("/shipments/bulk-refresh")
+def bulk_refresh_shipments(
+    selected_ids: list[int] = Form(default=[]),
+    tab: str = Form("active"),
+    db: Session = Depends(get_db),
+):
+    unique_ids = list(dict.fromkeys(selected_ids))
+    if not unique_ids:
+        return dashboard_redirect("Select at least one shipment to refresh", tab=tab)
+
+    shipments = list(db.scalars(select(Shipment).where(Shipment.id.in_(unique_ids))))
+    if not shipments:
+        return dashboard_redirect("No matching shipments found", tab=tab)
+
+    refreshed = 0
+    failed = 0
+    credential_failures: set[str] = set()
+    for shipment in shipments:
+        try:
+            sync_shipment_tracking(db, shipment)
+            db.commit()
+            refreshed += 1
+        except CarrierConfigurationError:
+            db.rollback()
+            credential_failures.add(shipment.carrier)
+            failed += 1
+        except CarrierRequestError:
+            db.rollback()
+            failed += 1
+
+    if credential_failures and not refreshed:
+        return dashboard_redirect("USPS credentials are missing", tab=tab)
+    if refreshed and failed:
+        message = f"Refreshed {refreshed} shipment(s). {failed} failed."
+    elif refreshed:
+        message = f"Refreshed {refreshed} shipment(s)"
+    else:
+        message = "Refresh failed for all selected shipments"
+    return dashboard_redirect(message, tab=tab)
+
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthcheck() -> str:
+    return "ok"

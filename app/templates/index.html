@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ settings.app_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}" />
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="TrackApp home">
+        <span class="brand-mark-wrap">
+          <img class="brand-mark" src="{{ url_for('static', path='hita-mark-white.png') }}" alt="Hita &amp; Co mark" />
+        </span>
+        <span class="brand-copy">
+          <span class="brand-kicker">Hita &amp; Co</span>
+          <strong>TrackApp</strong>
+        </span>
+      </a>
+
+      <nav class="tab-switcher" aria-label="Shipment sections">
+        <a href="/?tab=active" class="tab-pill {% if active_tab == 'active' %}active{% endif %}">Active <span>{{ metrics.active_count }}</span></a>
+        <a href="/?tab=archive" class="tab-pill {% if active_tab == 'archive' %}active{% endif %}">Archive <span>{{ metrics.archived_count }}</span></a>
+      </nav>
+    </header>
+
+    {% if message %}
+    <div class="notice">{{ message }}</div>
+    {% endif %}
+
+    <main class="dashboard-main">
+      <section class="composer-card slim-card">
+        <div class="card-head compact">
+          <div>
+            <p class="eyebrow">New shipment</p>
+            <h2>Add shipment</h2>
+          </div>
+        </div>
+
+        <form action="/shipments" method="post" class="stack inline-form">
+          <input type="text" name="name" placeholder="Name" />
+          <input type="text" name="tracking_number" placeholder="Tracking number" required />
+          <label class="checkbox"><input type="checkbox" name="sync_now" value="true" checked /> Sync immediately</label>
+          <button type="submit">Add</button>
+        </form>
+      </section>
+
+      <section class="panel shipments-panel">
+        <div class="card-head table-head">
+          <div>
+            <p class="eyebrow">Shipments</p>
+            <h2>{{ 'Archive' if active_tab == 'archive' else 'Active shipments' }}</h2>
+            <p class="subtle-copy">Archive automatically collects delivered shipments older than {{ archive_after_days }} days.</p>
+          </div>
+          <button type="submit" form="bulk-refresh-form" class="ghost-button">Refresh selected</button>
+        </div>
+
+        <div class="actions-help">Actions: <strong>Edit</strong> updates the saved name or tracking number. <strong>Refresh</strong> pulls the latest live USPS status. <strong>Delete</strong> removes the row. <strong>Track</strong> opens the official USPS tracking page.</div>
+
+        <form action="/shipments/bulk-refresh" method="post" id="bulk-refresh-form">
+          <input type="hidden" name="tab" value="{{ active_tab }}" />
+          <div class="table-wrap">
+            <table class="shipments-table">
+              <thead>
+                <tr>
+                  <th class="select-col"><input type="checkbox" id="select-all" aria-label="Select all shipments" /></th>
+                  <th>Name</th>
+                  <th>Tracking number</th>
+                  <th>Status</th>
+<th class="actions-col">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for shipment in shipments %}
+                {% set normalized_status = (shipment.status or '')|lower %}
+                {% if 'exception' in normalized_status or 'alert' in normalized_status or 'issue' in normalized_status or 'return' in normalized_status or 'fail' in normalized_status or 'undeliver' in normalized_status or 'delay' in normalized_status %}
+                  {% set dot_class = 'dot-red' %}
+                {% elif 'deliver' in normalized_status %}
+                  {% set dot_class = 'dot-green' %}
+                {% else %}
+                  {% set dot_class = 'dot-yellow' %}
+                {% endif %}
+
+                {% if editing_shipment and editing_shipment.id == shipment.id %}
+                <tr class="editing-row">
+                  <td class="select-col"><input type="checkbox" name="selected_ids" value="{{ shipment.id }}" class="row-checkbox" /></td>
+                  <td class="name-cell"><input type="text" name="name" value="{{ shipment.reference or '' }}" form="edit-form-{{ shipment.id }}" /></td>
+                  <td class="tracking-cell"><input type="text" name="tracking_number" value="{{ shipment.tracking_number }}" form="edit-form-{{ shipment.id }}" required /></td>
+                  <td>
+                    <span class="status-text">
+                      {{ shipment.status or 'In process' }}
+                      <span class="status-dot {{ dot_class }}" aria-hidden="true"></span>
+                    </span>
+                  </td>
+                  <td class="actions-cell">
+                    <form id="edit-form-{{ shipment.id }}" action="/shipments/{{ shipment.id }}/edit" method="post" class="inline-action-form">
+                      <input type="hidden" name="tab" value="{{ active_tab }}" />
+                      <button type="submit" class="ghost-button table-button">Save</button>
+                    </form>
+                    <a class="ghost-button table-button" href="/?tab={{ active_tab }}">Cancel</a>
+                    <button type="submit" class="ghost-button table-button danger-button" formaction="/shipments/{{ shipment.id }}/delete" formmethod="post" onclick="return confirm('Delete this shipment?');">Delete</button>
+                    <a class="ghost-button table-button" href="{{ shipment.official_tracking_url }}" target="_blank" rel="noreferrer">Track</a>
+                  </td>
+                </tr>
+                {% else %}
+                <tr>
+                  <td class="select-col"><input type="checkbox" name="selected_ids" value="{{ shipment.id }}" class="row-checkbox" /></td>
+                  <td class="name-cell">{{ shipment.reference or '—' }}</td>
+                  <td class="tracking-cell">{{ shipment.tracking_number }}</td>
+                  <td>
+                    <span class="status-text">
+                      {{ shipment.status or 'In process' }}
+                      <span class="status-dot {{ dot_class }}" aria-hidden="true"></span>
+                    </span>
+                  </td>
+                  <td class="actions-cell">
+                    <a class="ghost-button table-button" href="/?tab={{ active_tab }}&edit_id={{ shipment.id }}">Edit</a>
+                    <button type="submit" class="ghost-button table-button" formaction="/shipments/{{ shipment.id }}/refresh" formmethod="post">Refresh</button>
+                    <button type="submit" class="ghost-button table-button danger-button" formaction="/shipments/{{ shipment.id }}/delete" formmethod="post" onclick="return confirm('Delete this shipment?');">Delete</button>
+                    <a class="ghost-button table-button" href="{{ shipment.official_tracking_url }}" target="_blank" rel="noreferrer">Track</a>
+                  </td>
+                </tr>
+                {% endif %}
+                {% else %}
+                <tr>
+                  <td colspan="5" class="empty-row">
+                    {% if active_tab == 'archive' %}
+                    No archived shipments yet.
+                    {% else %}
+                    No shipments yet.
+                    {% endif %}
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const selectAll = document.getElementById('select-all');
+    const checkboxes = Array.from(document.querySelectorAll('.row-checkbox'));
+
+    if (selectAll) {
+      selectAll.addEventListener('change', () => {
+        checkboxes.forEach((checkbox) => {
+          checkbox.checked = selectAll.checked;
+        });
+      });
+    }
+  </script>
+</body>
+</html>
