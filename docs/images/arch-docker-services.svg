@@ -1,0 +1,120 @@
+<svg width="100%" viewBox="0 0 680 480" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: ui-sans-serif, system-ui, sans-serif; }
+      .t  { font-size: 14px; fill: #2C2C2A; }
+      .ts { font-size: 12px; fill: #5F5E5A; }
+      .th { font-size: 14px; font-weight: 500; fill: #2C2C2A; }
+      .arr { stroke: #888780; stroke-width: 1.5; fill: none; }
+      .section-label { font-size: 10px; font-weight: 500; fill: #888780; letter-spacing: 0.07em; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text style="font-size:16px;font-weight:500;fill:#2C2C2A;" x="340" y="36" text-anchor="middle">TrackApp — Docker Compose Services</text>
+  <text class="ts" x="340" y="54" text-anchor="middle">Services, dependencies, ports, and volumes</text>
+
+  <!-- Outer compose boundary -->
+  <rect x="20" y="68" width="540" height="300" rx="14" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="6 4"/>
+  <text class="section-label" x="34" y="87">DOCKER COMPOSE NETWORK</text>
+
+  <!-- web service -->
+  <g>
+    <rect x="44" y="100" width="155" height="80" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+    <text class="th" x="121" y="122" text-anchor="middle" dominant-baseline="central">web</text>
+    <text class="ts" x="121" y="142" text-anchor="middle" dominant-baseline="central">FastAPI · Uvicorn</text>
+    <text class="ts" x="121" y="160" text-anchor="middle" dominant-baseline="central">port 8000:8000</text>
+  </g>
+
+  <!-- worker service -->
+  <g>
+    <rect x="44" y="228" width="155" height="80" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+    <text class="th" x="121" y="250" text-anchor="middle" dominant-baseline="central">worker</text>
+    <text class="ts" x="121" y="270" text-anchor="middle" dominant-baseline="central">python -m app.worker</text>
+    <text class="ts" x="121" y="288" text-anchor="middle" dominant-baseline="central">APScheduler</text>
+  </g>
+
+  <!-- db service -->
+  <g>
+    <rect x="250" y="100" width="155" height="80" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+    <text class="th" x="327" y="122" text-anchor="middle" dominant-baseline="central">db</text>
+    <text class="ts" x="327" y="142" text-anchor="middle" dominant-baseline="central">postgres:16</text>
+    <text class="ts" x="327" y="160" text-anchor="middle" dominant-baseline="central">port 5432:5432</text>
+  </g>
+
+  <!-- mailpit service -->
+  <g>
+    <rect x="250" y="228" width="155" height="80" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+    <text class="th" x="327" y="250" text-anchor="middle" dominant-baseline="central">mailpit</text>
+    <text class="ts" x="327" y="270" text-anchor="middle" dominant-baseline="central">axllent/mailpit</text>
+    <text class="ts" x="327" y="288" text-anchor="middle" dominant-baseline="central">:8025 UI · :1025 SMTP</text>
+  </g>
+
+  <!-- depends_on arrows: web → db -->
+  <line x1="199" y1="130" x2="248" y2="130" class="arr" marker-end="url(#arrow)" stroke="#3B6D11"/>
+  <text class="ts" x="223" y="122" text-anchor="middle" fill="#3B6D11">depends_on</text>
+
+  <!-- web → mailpit -->
+  <path d="M199 158 L224 158 L224 268 L248 268" class="arr" marker-end="url(#arrow)" stroke="#854F0B" fill="none"/>
+  <text class="ts" x="220" y="218" text-anchor="start" fill="#854F0B">depends_on</text>
+
+  <!-- worker → db -->
+  <path d="M199 258 L224 258 L224 150 L248 150" class="arr" marker-end="url(#arrow)" stroke="#3B6D11" fill="none"/>
+
+  <!-- worker → mailpit -->
+  <line x1="199" y1="278" x2="248" y2="278" class="arr" marker-end="url(#arrow)" stroke="#854F0B"/>
+
+  <!-- Volumes section -->
+  <rect x="456" y="100" width="82" height="60" rx="8" fill="#F1EFE8" stroke="#888780" stroke-width="0.5" stroke-dasharray="4 3"/>
+  <text class="th" x="497" y="122" text-anchor="middle" dominant-baseline="central">postgres</text>
+  <text class="ts" x="497" y="140" text-anchor="middle" dominant-baseline="central">_data vol.</text>
+
+  <rect x="456" y="200" width="82" height="60" rx="8" fill="#F1EFE8" stroke="#888780" stroke-width="0.5" stroke-dasharray="4 3"/>
+  <text class="th" x="497" y="222" text-anchor="middle" dominant-baseline="central">./app</text>
+  <text class="ts" x="497" y="240" text-anchor="middle" dominant-baseline="central">bind mount</text>
+
+  <!-- db → postgres_data -->
+  <line x1="405" y1="135" x2="454" y2="128" class="arr" marker-end="url(#arrow)" stroke="#888780" stroke-dasharray="4 3"/>
+  <text class="ts" x="428" y="122" text-anchor="middle">volume</text>
+
+  <!-- web/worker → ./app bind mount -->
+  <line x1="199" y1="140" x2="454" y2="218" class="arr" marker-end="url(#arrow)" stroke="#888780" stroke-dasharray="4 3"/>
+  <line x1="199" y1="270" x2="454" y2="238" class="arr" marker-end="url(#arrow)" stroke="#888780" stroke-dasharray="4 3"/>
+
+  <!-- External: browser -->
+  <rect x="580" y="100" width="84" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text class="th" x="622" y="121" text-anchor="middle" dominant-baseline="central">Browser</text>
+  <text class="ts" x="622" y="139" text-anchor="middle" dominant-baseline="central">:8000</text>
+
+  <!-- External: dev email -->
+  <rect x="580" y="200" width="84" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+  <text class="th" x="622" y="221" text-anchor="middle" dominant-baseline="central">Dev email</text>
+  <text class="ts" x="622" y="239" text-anchor="middle" dominant-baseline="central">:8025</text>
+
+  <!-- web → browser port -->
+  <line x1="564" y1="128" x2="578" y2="125" class="arr" marker-end="url(#arrow)" stroke="#185FA5"/>
+
+  <!-- mailpit → dev email -->
+  <line x1="564" y1="248" x2="578" y2="230" class="arr" marker-end="url(#arrow)" stroke="#854F0B"/>
+
+  <!-- Legend -->
+  <rect x="20" y="386" width="640" height="76" rx="8" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="0.5"/>
+  <text class="section-label" x="34" y="404">LEGEND</text>
+  <line x1="34" y1="422" x2="60" y2="422" stroke="#888780" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <text class="ts" x="66" y="426">depends_on (startup order)</text>
+  <line x1="240" y1="422" x2="266" y2="422" stroke="#888780" stroke-width="1" stroke-dasharray="4 3" fill="none" marker-end="url(#arrow)"/>
+  <text class="ts" x="272" y="426">volume mount</text>
+  <rect x="420" y="415" width="12" height="12" rx="2" fill="#F1EFE8" stroke="#888780" stroke-width="0.5" stroke-dasharray="4 3"/>
+  <text class="ts" x="438" y="426">Named / bind volume</text>
+  <line x1="34" y1="450" x2="60" y2="450" stroke="#185FA5" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <text class="ts" x="66" y="454">Exposed port to host</text>
+  <rect x="240" y="443" width="12" height="12" rx="2" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text class="ts" x="258" y="454">Python service</text>
+  <rect x="360" y="443" width="12" height="12" rx="2" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+  <text class="ts" x="378" y="454">Database</text>
+  <rect x="480" y="443" width="12" height="12" rx="2" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+  <text class="ts" x="498" y="454">Mail service</text>
+</svg>
