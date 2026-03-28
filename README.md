@@ -163,4 +163,4 @@ pytest
 
 ## 📄 License
 
-This project does not currently specify a license. Contact the author for usage terms.
+This project is licensed under the Apache License 2.0. See the LICENSE file for details.
