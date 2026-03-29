@@ -9,7 +9,7 @@
 <body>
   <div class="page-shell">
     <header class="topbar">
-      <a class="brand" href="/" aria-label="TrackApp home">
+      <a class="brand" href="http://localhost:10000" aria-label="Operational portal">
         <span class="brand-mark-wrap">
           <img class="brand-mark" src="{{ url_for('static', path='hita-mark-white.png') }}" alt="Hita &amp; Co mark" />
         </span>
@@ -21,6 +21,7 @@
 
       <nav class="tab-switcher" aria-label="Shipment sections">
         <a href="/?tab=active" class="tab-pill {% if active_tab == 'active' %}active{% endif %}">Active <span>{{ metrics.active_count }}</span></a>
+        <a href="/?tab=delivered" class="tab-pill {% if active_tab == 'delivered' %}active{% endif %}">Delivered <span>{{ metrics.delivered_count }}</span></a>
         <a href="/?tab=archive" class="tab-pill {% if active_tab == 'archive' %}active{% endif %}">Archive <span>{{ metrics.archived_count }}</span></a>
       </nav>
     </header>
@@ -50,10 +51,32 @@
         <div class="card-head table-head">
           <div>
             <p class="eyebrow">Shipments</p>
-            <h2>{{ 'Archive' if active_tab == 'archive' else 'Active shipments' }}</h2>
+            <h2>
+              {% if active_tab == 'archive' %}
+                Archive
+              {% elif active_tab == 'delivered' %}
+                Delivered shipments
+              {% else %}
+                Active shipments
+              {% endif %}
+            </h2>
             <p class="subtle-copy">Archive automatically collects delivered shipments older than {{ archive_after_days }} days.</p>
           </div>
-          <button type="submit" form="bulk-refresh-form" class="ghost-button">Refresh selected</button>
+          {% if active_tab == 'archive' %}
+            <form action="/shipments/purge-archive" method="post" style="display:inline">
+              <input type="hidden" name="days" value="30" />
+              <button type="submit" class="ghost-button" onclick="return confirm('Delete USPS archived shipments older than 30 days? This cannot be undone.');">Purge old USPS</button>
+            </form>
+            <button type="submit" form="bulk-refresh-form" formaction="/shipments/bulk-delete" formmethod="post" class="ghost-button danger-button bulk-action" onclick="return confirm('Delete selected archived shipments? This cannot be undone.');">Delete selected</button>
+          {% elif active_tab == 'delivered' %}
+            <button type="submit" form="bulk-refresh-form" formaction="/shipments/bulk-archive" formmethod="post" class="ghost-button bulk-action" onclick="return confirm('Move selected delivered shipments to archive?');">Confirm archive selected</button>
+          {% elif active_tab == 'active' %}
+            <button type="submit" form="bulk-refresh-form" class="ghost-button bulk-action">Refresh selected</button>
+            <button type="submit" form="bulk-refresh-form" formaction="/shipments/bulk-edit" formmethod="post" class="ghost-button bulk-action">Edit selected</button>
+            <button type="submit" form="bulk-refresh-form" formaction="/shipments/bulk-delete" formmethod="post" class="ghost-button danger-button bulk-action" onclick="return confirm('Delete selected shipments? This cannot be undone.');">Delete selected</button>
+          {% else %}
+            <button type="submit" form="bulk-refresh-form" class="ghost-button bulk-action">Refresh selected</button>
+          {% endif %}
         </div>
 
         <div class="actions-help">Actions: <strong>Edit</strong> updates the saved name or tracking number. <strong>Refresh</strong> pulls the latest live USPS status. <strong>Delete</strong> removes the row. <strong>Track</strong> opens the official USPS tracking page.</div>
@@ -68,7 +91,7 @@
                   <th>Name</th>
                   <th>Tracking number</th>
                   <th>Status</th>
-<th class="actions-col">Actions</th>
+                  
                 </tr>
               </thead>
               <tbody>
@@ -93,15 +116,6 @@
                       <span class="status-dot {{ dot_class }}" aria-hidden="true"></span>
                     </span>
                   </td>
-                  <td class="actions-cell">
-                    <form id="edit-form-{{ shipment.id }}" action="/shipments/{{ shipment.id }}/edit" method="post" class="inline-action-form">
-                      <input type="hidden" name="tab" value="{{ active_tab }}" />
-                      <button type="submit" class="ghost-button table-button">Save</button>
-                    </form>
-                    <a class="ghost-button table-button" href="/?tab={{ active_tab }}">Cancel</a>
-                    <button type="submit" class="ghost-button table-button danger-button" formaction="/shipments/{{ shipment.id }}/delete" formmethod="post" onclick="return confirm('Delete this shipment?');">Delete</button>
-                    <a class="ghost-button table-button" href="{{ shipment.official_tracking_url }}" target="_blank" rel="noreferrer">Track</a>
-                  </td>
                 </tr>
                 {% else %}
                 <tr>
@@ -114,17 +128,12 @@
                       <span class="status-dot {{ dot_class }}" aria-hidden="true"></span>
                     </span>
                   </td>
-                  <td class="actions-cell">
-                    <a class="ghost-button table-button" href="/?tab={{ active_tab }}&edit_id={{ shipment.id }}">Edit</a>
-                    <button type="submit" class="ghost-button table-button" formaction="/shipments/{{ shipment.id }}/refresh" formmethod="post">Refresh</button>
-                    <button type="submit" class="ghost-button table-button danger-button" formaction="/shipments/{{ shipment.id }}/delete" formmethod="post" onclick="return confirm('Delete this shipment?');">Delete</button>
-                    <a class="ghost-button table-button" href="{{ shipment.official_tracking_url }}" target="_blank" rel="noreferrer">Track</a>
-                  </td>
+                  
                 </tr>
                 {% endif %}
                 {% else %}
                 <tr>
-                  <td colspan="5" class="empty-row">
+                  <td colspan="4" class="empty-row">
                     {% if active_tab == 'archive' %}
                     No archived shipments yet.
                     {% else %}
@@ -142,16 +151,40 @@
   </div>
 
   <script>
+    // Selection helpers: toggle checkboxes and enable/disable bulk header buttons
     const selectAll = document.getElementById('select-all');
-    const checkboxes = Array.from(document.querySelectorAll('.row-checkbox'));
+
+    function getRowCheckboxes() {
+      return Array.from(document.querySelectorAll('.row-checkbox'));
+    }
+
+    function getBulkButtons() {
+      return Array.from(document.querySelectorAll('.bulk-action'));
+    }
+
+    function updateBulkButtons() {
+      const anyChecked = getRowCheckboxes().some(cb => cb.checked);
+      getBulkButtons().forEach(btn => {
+        btn.disabled = !anyChecked;
+        if (btn.disabled) btn.classList.add('disabled'); else btn.classList.remove('disabled');
+      });
+    }
 
     if (selectAll) {
       selectAll.addEventListener('change', () => {
-        checkboxes.forEach((checkbox) => {
+        getRowCheckboxes().forEach((checkbox) => {
           checkbox.checked = selectAll.checked;
         });
+        updateBulkButtons();
       });
     }
+
+    // Attach change listeners to row checkboxes
+    document.addEventListener('DOMContentLoaded', () => {
+      getRowCheckboxes().forEach(cb => cb.addEventListener('change', updateBulkButtons));
+      // Initialize state on load
+      updateBulkButtons();
+    });
   </script>
 </body>
 </html>

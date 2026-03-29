@@ -27,6 +27,7 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 TRACKING_RE = re.compile(r"^[A-Za-z0-9-]{8,34}$")
 ARCHIVE_AFTER_DAYS = 10
+PURGE_AFTER_DAYS = 30
 
 
 def shipment_is_archived(shipment: Shipment) -> bool:
@@ -44,7 +45,7 @@ def startup() -> None:
 
 
 def dashboard_redirect(message: str, tab: str = "active", edit_id: int | None = None) -> RedirectResponse:
-    params: dict[str, str] = {"message": message, "tab": "archive" if tab == "archive" else "active"}
+    params: dict[str, str] = {"message": message, "tab": tab if tab in ("active", "archive", "delivered") else "active"}
     if edit_id is not None:
         params["edit_id"] = str(edit_id)
     return RedirectResponse(url=f"/?{urlencode(params)}", status_code=303)
@@ -69,9 +70,23 @@ def dashboard(
     )
 
     archived_shipments = [shipment for shipment in all_shipments if shipment_is_archived(shipment)]
-    active_shipments = [shipment for shipment in all_shipments if not shipment_is_archived(shipment)]
-    active_tab = "archive" if tab == "archive" else "active"
-    visible_shipments = archived_shipments if active_tab == "archive" else active_shipments
+    delivered_shipments = [
+        shipment
+        for shipment in all_shipments
+        if (shipment.status or "") and "deliver" in (shipment.status or "").lower() and not shipment_is_archived(shipment)
+    ]
+    active_shipments = [
+        shipment
+        for shipment in all_shipments
+        if shipment not in archived_shipments and shipment not in delivered_shipments
+    ]
+    active_tab = tab if tab in ("active", "archive", "delivered") else "active"
+    if active_tab == "archive":
+        visible_shipments = archived_shipments
+    elif active_tab == "delivered":
+        visible_shipments = delivered_shipments
+    else:
+        visible_shipments = active_shipments
 
     editing_shipment = db.get(Shipment, edit_id) if edit_id else None
 
@@ -88,6 +103,7 @@ def dashboard(
         or 0,
         "archived_count": len(archived_shipments),
         "active_count": len(active_shipments),
+        "delivered_count": len(delivered_shipments),
     }
     return templates.TemplateResponse(
         request,
@@ -204,6 +220,62 @@ def delete_shipment(
     return dashboard_redirect("Shipment deleted", tab=tab)
 
 
+@app.post("/shipments/{shipment_id}/archive")
+def archive_shipment(
+    shipment_id: int,
+    tab: str = Form("active"),
+    db: Session = Depends(get_db),
+):
+    """Mark a delivered shipment as archived (manual confirmation).
+
+    This sets the shipment's last_event_at to a time older than the archive cutoff
+    so `shipment_is_archived` will return True without adding a new DB column.
+    """
+    shipment = db.get(Shipment, shipment_id)
+    if not shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found")
+
+    status = (shipment.status or "").lower()
+    if "deliver" not in status and not shipment_is_archived(shipment):
+        return dashboard_redirect("Only delivered shipments can be archived manually", tab=tab)
+
+    # Set last_event_at to older than the archive cutoff so it is considered archived
+    shipment.last_event_at = utcnow() - timedelta(days=ARCHIVE_AFTER_DAYS + 1)
+    db.add(shipment)
+    db.commit()
+    return dashboard_redirect("Shipment moved to archive", tab="archive")
+
+
+@app.post("/shipments/purge-archive")
+def purge_archive(
+    days: int = Form(PURGE_AFTER_DAYS),
+    db: Session = Depends(get_db),
+):
+    """Delete USPS shipments that are delivered and older than `days` days.
+
+    This is a manual purge action triggered from the Archive view.
+    """
+    cutoff = utcnow() - timedelta(days=days)
+    # select shipments that are USPS, status contains 'deliver', and whose
+    # last_event_at/updated_at/created_at is older than cutoff
+    candidates = list(
+        db.scalars(
+            select(Shipment).where(
+                Shipment.carrier == "USPS",
+                func.lower(Shipment.status).like("%deliver%"),
+                func.coalesce(Shipment.last_event_at, Shipment.updated_at, Shipment.created_at) <= cutoff,
+            )
+        ).all()
+    )
+    count = 0
+    for s in candidates:
+        db.delete(s)
+        count += 1
+    if count:
+        db.commit()
+    return dashboard_redirect(f"Purged {count} USPS archived shipment(s) older than {days} days", tab="archive")
+
+
 @app.post("/shipments/{shipment_id}/refresh")
 def refresh_shipment(
     shipment_id: int,
@@ -213,6 +285,10 @@ def refresh_shipment(
     shipment = db.get(Shipment, shipment_id)
     if not shipment:
         raise HTTPException(status_code=404, detail="Shipment not found")
+    # Do not poll or refresh shipments that are delivered or archived
+    status = (shipment.status or "").lower()
+    if "deliver" in status or shipment_is_archived(shipment):
+        return dashboard_redirect("Delivered or archived shipments are not refreshed", tab=tab)
 
     try:
         sync_shipment_tracking(db, shipment)
@@ -225,6 +301,79 @@ def refresh_shipment(
         db.rollback()
         message = f"USPS refresh failed: {str(exc)[:120]}"
     return dashboard_redirect(message, tab=tab)
+
+
+@app.post("/shipments/bulk-delete")
+def bulk_delete_shipments(
+    selected_ids: list[int] = Form(default=[]),
+    tab: str = Form("archive"),
+    db: Session = Depends(get_db),
+):
+    unique_ids = list(dict.fromkeys(selected_ids))
+    if not unique_ids:
+        return dashboard_redirect("Select at least one shipment to delete", tab=tab)
+
+    shipments = list(db.scalars(select(Shipment).where(Shipment.id.in_(unique_ids))).all())
+    if not shipments:
+        return dashboard_redirect("No matching shipments found", tab=tab)
+
+    deleted = 0
+    for shipment in shipments:
+        db.delete(shipment)
+        deleted += 1
+    db.commit()
+    return dashboard_redirect(f"Deleted {deleted} shipment(s)", tab=tab)
+
+
+@app.post("/shipments/bulk-archive")
+def bulk_archive_shipments(
+    selected_ids: list[int] = Form(default=[]),
+    tab: str = Form("delivered"),
+    db: Session = Depends(get_db),
+):
+    unique_ids = list(dict.fromkeys(selected_ids))
+    if not unique_ids:
+        return dashboard_redirect("Select at least one shipment to archive", tab=tab)
+
+    shipments = list(db.scalars(select(Shipment).where(Shipment.id.in_(unique_ids))).all())
+    if not shipments:
+        return dashboard_redirect("No matching shipments found", tab=tab)
+
+    archived = 0
+    for shipment in shipments:
+        status = (shipment.status or "").lower()
+        # Only archive delivered shipments (or those already considered archived)
+        if "deliver" not in status and not shipment_is_archived(shipment):
+            continue
+        shipment.last_event_at = utcnow() - timedelta(days=ARCHIVE_AFTER_DAYS + 1)
+        db.add(shipment)
+        archived += 1
+
+    if archived:
+        db.commit()
+    return dashboard_redirect(f"Archived {archived} shipment(s)", tab="archive")
+
+
+@app.post("/shipments/bulk-edit")
+def bulk_edit_shipments(
+    selected_ids: list[int] = Form(default=[]),
+    tab: str = Form("active"),
+    db: Session = Depends(get_db),
+):
+    """Redirect to edit the first selected shipment. This lets users pick a row via checkboxes
+    and hit "Edit selected"; we open the edit form for the first selected id.
+    """
+    unique_ids = list(dict.fromkeys(selected_ids))
+    if not unique_ids:
+        return dashboard_redirect("Select at least one shipment to edit", tab=tab)
+
+    first_id = unique_ids[0]
+    # ensure exists
+    shipment = db.get(Shipment, first_id)
+    if not shipment:
+        return dashboard_redirect("Selected shipment not found", tab=tab)
+
+    return dashboard_redirect("Editing selected shipment", tab=tab, edit_id=first_id)
 
 
 @app.post("/shipments/bulk-refresh")
@@ -243,8 +392,14 @@ def bulk_refresh_shipments(
 
     refreshed = 0
     failed = 0
+    skipped = 0
     credential_failures: set[str] = set()
     for shipment in shipments:
+        # skip delivered or archived shipments
+        status = (shipment.status or "").lower()
+        if "deliver" in status or shipment_is_archived(shipment):
+            skipped += 1
+            continue
         try:
             sync_shipment_tracking(db, shipment)
             db.commit()
@@ -260,11 +415,11 @@ def bulk_refresh_shipments(
     if credential_failures and not refreshed:
         return dashboard_redirect("USPS credentials are missing", tab=tab)
     if refreshed and failed:
-        message = f"Refreshed {refreshed} shipment(s). {failed} failed."
+        message = f"Refreshed {refreshed} shipment(s). {failed} failed. {skipped} skipped."
     elif refreshed:
-        message = f"Refreshed {refreshed} shipment(s)"
+        message = f"Refreshed {refreshed} shipment(s). {skipped} skipped."
     else:
-        message = "Refresh failed for all selected shipments"
+        message = f"No shipments refreshed. {skipped} skipped."
     return dashboard_redirect(message, tab=tab)
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.config import get_settings
 from app.db import Base, engine, session_scope
@@ -24,7 +24,9 @@ def run_worker() -> None:
                 db.scalars(
                     select(Shipment).where(
                         Shipment.carrier == "USPS",
-                        Shipment.last_synced_at.is_(None) | (Shipment.last_synced_at < stale_before)
+                        Shipment.last_synced_at.is_(None) | (Shipment.last_synced_at < stale_before),
+                        # exclude delivered shipments from polling
+                        (Shipment.status.is_(None) | (~func.lower(Shipment.status).like("%deliver%")))
                     )
                 ).all()
             )
