@@ -8,7 +8,12 @@ from sqlalchemy import select, func
 from app.config import get_settings
 from app.db import Base, engine, session_scope
 from app.models import Shipment, utcnow
-from app.services.carriers import CarrierConfigurationError, CarrierRequestError, sync_shipment_tracking
+from app.services.carriers import (
+    CarrierAccessRestrictedError,
+    CarrierConfigurationError,
+    CarrierRequestError,
+    sync_shipment_tracking,
+)
 
 settings = get_settings()
 
@@ -26,7 +31,13 @@ def run_worker() -> None:
                         Shipment.carrier == "USPS",
                         Shipment.last_synced_at.is_(None) | (Shipment.last_synced_at < stale_before),
                         # exclude delivered shipments from polling
-                        (Shipment.status.is_(None) | (~func.lower(Shipment.status).like("%deliver%")))
+                        (
+                            Shipment.status.is_(None)
+                            | (
+                                (~func.lower(Shipment.status).like("%deliver%"))
+                                & (~func.lower(Shipment.status).like("%access restricted%"))
+                            )
+                        )
                     )
                 ).all()
             )
@@ -36,6 +47,8 @@ def run_worker() -> None:
                     print(f"Refreshed USPS {shipment.tracking_number}")
                 except CarrierConfigurationError as exc:
                     print(f"Skipped USPS {shipment.tracking_number}: {exc}")
+                except CarrierAccessRestrictedError as exc:
+                    print(f"Blocked USPS {shipment.tracking_number}: {exc}")
                 except CarrierRequestError as exc:
                     print(f"Refresh failed for USPS {shipment.tracking_number}: {exc}")
 

@@ -17,6 +17,10 @@ class CarrierRequestError(RuntimeError):
     pass
 
 
+class CarrierAccessRestrictedError(CarrierRequestError):
+    pass
+
+
 def normalize_carrier(value: str | None) -> str:
     raw = (value or "USPS").strip().lower()
     if raw in {"usps", "postal", "postal service"}:
@@ -46,6 +50,8 @@ def sync_shipment_tracking(db: Session, shipment: Shipment) -> Shipment:
             return usps.sync_shipment_tracking(db, shipment)
         except usps.USPSConfigurationError as exc:
             raise CarrierConfigurationError(str(exc)) from exc
+        except usps.USPSAccessRestrictedError as exc:
+            raise CarrierAccessRestrictedError(str(exc)) from exc
         except usps.USPSRequestError as exc:
             raise CarrierRequestError(str(exc)) from exc
     if normalized == "FedEx":

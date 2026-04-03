@@ -22,6 +22,12 @@ class USPSRequestError(RuntimeError):
     pass
 
 
+class USPSAccessRestrictedError(USPSRequestError):
+    def __init__(self, message: str, payload: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.payload = payload or {}
+
+
 @dataclass
 class OAuthToken:
     access_token: str
@@ -56,6 +62,23 @@ def _ensure_credentials() -> None:
         raise USPSConfigurationError(
             "USPS credentials are not configured. Add USPS_CLIENT_ID and USPS_CLIENT_SECRET to .env."
         )
+
+
+def _extract_error_payload(response: httpx.Response) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _extract_error_message(payload: dict[str, Any]) -> str | None:
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return None
 
 
 def _get_token() -> str:
@@ -94,11 +117,35 @@ def fetch_tracking_detail(tracking_number: str) -> dict[str, Any]:
     with httpx.Client(timeout=25.0) as client:
         response = client.get(url, headers=headers, params=params)
     if response.status_code >= 400:
-        raise USPSRequestError(f"USPS tracking failed: {response.status_code} {response.text[:400]}")
+        error_payload = _extract_error_payload(response)
+        error_message = _extract_error_message(error_payload)
+        if response.status_code == 403 and error_message:
+            lowered = error_message.lower()
+            if "not authorized to access" in lowered or "access controls" in lowered or "ip agreement" in lowered:
+                raise USPSAccessRestrictedError(
+                    "USPS access restricted for this tracking number. Submit the USPS IP Agreement inquiry to re-enable API tracking.",
+                    payload=error_payload,
+                )
+        detail = error_message or response.text[:400]
+        raise USPSRequestError(f"USPS tracking failed: {response.status_code} {detail[:400]}")
     data = response.json()
     if not isinstance(data, dict):
         raise USPSRequestError("Unexpected USPS tracking response shape.")
     return data
+
+
+def _mark_access_restricted(shipment: Shipment, exc: USPSAccessRestrictedError) -> None:
+    shipment.official_tracking_url = official_tracking_url(shipment.tracking_number)
+    shipment.last_synced_at = utcnow()
+    shipment.status = "USPS access restricted"
+    shipment.status_category = "Authorization"
+    shipment.status_summary = str(exc)
+    shipment.latest_payload = exc.payload or {
+        "error": {
+            "code": "403",
+            "message": str(exc),
+        }
+    }
 
 
 def _derive_recipient_data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -153,7 +200,13 @@ def _sync_recipient_profile(db: Session, shipment: Shipment, payload: dict[str, 
 
 
 def sync_shipment_tracking(db: Session, shipment: Shipment) -> Shipment:
-    payload = fetch_tracking_detail(shipment.tracking_number)
+    try:
+        payload = fetch_tracking_detail(shipment.tracking_number)
+    except USPSAccessRestrictedError as exc:
+        _mark_access_restricted(shipment, exc)
+        db.add(shipment)
+        db.flush()
+        raise
     shipment.official_tracking_url = official_tracking_url(shipment.tracking_number)
     shipment.latest_payload = payload
     shipment.last_synced_at = utcnow()

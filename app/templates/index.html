@@ -97,7 +97,7 @@
               <tbody>
                 {% for shipment in shipments %}
                 {% set normalized_status = (shipment.status or '')|lower %}
-                {% if 'exception' in normalized_status or 'alert' in normalized_status or 'issue' in normalized_status or 'return' in normalized_status or 'fail' in normalized_status or 'undeliver' in normalized_status or 'delay' in normalized_status %}
+                {% if 'exception' in normalized_status or 'alert' in normalized_status or 'issue' in normalized_status or 'return' in normalized_status or 'fail' in normalized_status or 'undeliver' in normalized_status or 'delay' in normalized_status or 'restrict' in normalized_status or 'authoriz' in normalized_status %}
                   {% set dot_class = 'dot-red' %}
                 {% elif 'deliver' in normalized_status %}
                   {% set dot_class = 'dot-green' %}

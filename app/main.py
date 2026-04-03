@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.db import Base, engine, get_db
 from app.models import RecipientProfile, Shipment, TrackingEvent, utcnow
 from app.services.carriers import (
+    CarrierAccessRestrictedError,
     CarrierConfigurationError,
     CarrierRequestError,
     official_tracking_url,
@@ -162,6 +163,9 @@ def create_shipment(
         except CarrierConfigurationError:
             db.commit()
             message = "Shipment saved. Configure USPS credentials to sync live tracking"
+        except CarrierAccessRestrictedError as exc:
+            db.commit()
+            message = f"Shipment saved. {str(exc)[:120]}"
         except CarrierRequestError as exc:
             db.commit()
             message = f"Shipment saved. USPS sync failed: {str(exc)[:120]}"
@@ -297,6 +301,9 @@ def refresh_shipment(
     except CarrierConfigurationError:
         db.rollback()
         message = "USPS credentials are missing"
+    except CarrierAccessRestrictedError as exc:
+        db.commit()
+        message = str(exc)[:120]
     except CarrierRequestError as exc:
         db.rollback()
         message = f"USPS refresh failed: {str(exc)[:120]}"
@@ -393,6 +400,7 @@ def bulk_refresh_shipments(
     refreshed = 0
     failed = 0
     skipped = 0
+    blocked = 0
     credential_failures: set[str] = set()
     for shipment in shipments:
         # skip delivered or archived shipments
@@ -408,18 +416,23 @@ def bulk_refresh_shipments(
             db.rollback()
             credential_failures.add(shipment.carrier)
             failed += 1
+        except CarrierAccessRestrictedError:
+            db.commit()
+            blocked += 1
         except CarrierRequestError:
             db.rollback()
             failed += 1
 
     if credential_failures and not refreshed:
         return dashboard_redirect("USPS credentials are missing", tab=tab)
-    if refreshed and failed:
-        message = f"Refreshed {refreshed} shipment(s). {failed} failed. {skipped} skipped."
+    if refreshed and (failed or blocked):
+        message = f"Refreshed {refreshed} shipment(s). {blocked} blocked. {failed} failed. {skipped} skipped."
     elif refreshed:
         message = f"Refreshed {refreshed} shipment(s). {skipped} skipped."
+    elif blocked and not failed:
+        message = f"No shipments refreshed. {blocked} blocked by USPS access controls. {skipped} skipped."
     else:
-        message = f"No shipments refreshed. {skipped} skipped."
+        message = f"No shipments refreshed. {failed} failed. {skipped} skipped."
     return dashboard_redirect(message, tab=tab)
 
 
