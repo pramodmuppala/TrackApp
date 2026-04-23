@@ -9,11 +9,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./usps_tracker.db"
     base_url: str = "http://localhost:8000"
 
-    usps_client_id: str | None = None
-    usps_client_secret: str | None = None
-    usps_base_url: str = "https://apis.usps.com"
-    usps_oauth_path: str = "/oauth2/v3/token"
-    usps_tracking_path_template: str = "/tracking/v3/tracking/{tracking_number}"
+    usps_browser_timeout_seconds: int = 45
 
     fedex_client_id: str | None = None
     fedex_client_secret: str | None = None

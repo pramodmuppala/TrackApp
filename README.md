@@ -1,6 +1,6 @@
 # 📦 TrackApp
 
-A self-hosted **USPS shipment tracking dashboard** built with FastAPI. Add custom names to tracking numbers, bulk-refresh statuses, and auto-archive delivered packages — all running locally via Docker.
+A self-hosted **USPS shipment tracking dashboard** built with FastAPI. Add custom names to tracking numbers, bulk-refresh statuses, and auto-archive delivered packages — all running locally via Docker and USPS's public tracking page.
 
 ---
 
@@ -51,7 +51,7 @@ A self-hosted **USPS shipment tracking dashboard** built with FastAPI. Add custo
 | **Database** | PostgreSQL 16 |
 | **DB Driver** | psycopg 3 (binary) |
 | **Templates** | Jinja2 |
-| **HTTP client** | HTTPX |
+| **Browser automation** | Selenium + Safari WebDriver |
 | **Scheduler** | APScheduler 3 |
 | **Config** | pydantic-settings |
 | **Dev email** | Mailpit |
@@ -65,7 +65,8 @@ A self-hosted **USPS shipment tracking dashboard** built with FastAPI. Add custo
 ### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-- USPS API credentials (Client ID + Client Secret)
+- Safari on macOS
+- Safari `Develop > Allow Remote Automation` enabled once
 
 ### 1. Clone the repo
 
@@ -80,11 +81,10 @@ cd TrackApp
 cp .env.example .env
 ```
 
-Open `.env` and fill in your USPS credentials:
+Open `.env` and confirm the USPS browser timeout if you want to override the default:
 
 ```env
-USPS_CLIENT_ID=your_client_id_here
-USPS_CLIENT_SECRET=your_client_secret_here
+USPS_BROWSER_TIMEOUT_SECONDS=45
 ```
 
 ### 3. Start the app
@@ -108,8 +108,7 @@ The Mailpit web UI is available at **http://localhost:8025** — all outbound em
 
 | Variable | Description |
 |---|---|
-| `USPS_CLIENT_ID` | Your USPS Web Tools / OAuth2 Client ID |
-| `USPS_CLIENT_SECRET` | Your USPS OAuth2 Client Secret |
+| `USPS_BROWSER_TIMEOUT_SECONDS` | How long Safari gets to load USPS tracking results |
 
 Additional settings (database URL, SMTP host, etc.) can be found in `.env.example`.
 
@@ -127,7 +126,7 @@ TrackApp/
 │   ├── main.py           # FastAPI app entry point & routes
 │   ├── models.py         # SQLAlchemy ORM models
 │   ├── schemas.py        # Pydantic request/response schemas
-│   ├── usps.py           # USPS API client (OAuth2 + tracking)
+│   ├── services/usps.py  # USPS web tracking client (Safari automation + parsing)
 │   ├── worker.py         # APScheduler background job
 │   └── templates/        # Jinja2 HTML templates
 ├── tests/                # pytest test suite
@@ -158,6 +157,7 @@ pytest
 - This dashboard is **USPS-only**. Existing FedEx / UPS rows from older multi-carrier builds are ignored.
 - If you are migrating from an older build, run `docker compose down -v` once to reset the database volume before starting.
 - The background worker polls USPS automatically on a schedule — no manual refresh is required, though bulk refresh is available on demand.
+- USPS sync now uses the public USPS tracking website in Safari instead of the USPS OAuth/API flow.
 
 ---
 

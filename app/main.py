@@ -160,9 +160,9 @@ def create_shipment(
             sync_shipment_tracking(db, shipment)
             db.commit()
             message = "Shipment created and synced"
-        except CarrierConfigurationError:
+        except CarrierConfigurationError as exc:
             db.commit()
-            message = "Shipment saved. Configure USPS credentials to sync live tracking"
+            message = f"Shipment saved. {str(exc)[:120]}"
         except CarrierAccessRestrictedError as exc:
             db.commit()
             message = f"Shipment saved. {str(exc)[:120]}"
@@ -298,9 +298,9 @@ def refresh_shipment(
         sync_shipment_tracking(db, shipment)
         db.commit()
         message = "Shipment refreshed"
-    except CarrierConfigurationError:
+    except CarrierConfigurationError as exc:
         db.rollback()
-        message = "USPS credentials are missing"
+        message = str(exc)[:120]
     except CarrierAccessRestrictedError as exc:
         db.commit()
         message = str(exc)[:120]
@@ -401,7 +401,7 @@ def bulk_refresh_shipments(
     failed = 0
     skipped = 0
     blocked = 0
-    credential_failures: set[str] = set()
+    configuration_errors: list[str] = []
     for shipment in shipments:
         # skip delivered or archived shipments
         status = (shipment.status or "").lower()
@@ -412,9 +412,9 @@ def bulk_refresh_shipments(
             sync_shipment_tracking(db, shipment)
             db.commit()
             refreshed += 1
-        except CarrierConfigurationError:
+        except CarrierConfigurationError as exc:
             db.rollback()
-            credential_failures.add(shipment.carrier)
+            configuration_errors.append(str(exc))
             failed += 1
         except CarrierAccessRestrictedError:
             db.commit()
@@ -423,8 +423,8 @@ def bulk_refresh_shipments(
             db.rollback()
             failed += 1
 
-    if credential_failures and not refreshed:
-        return dashboard_redirect("USPS credentials are missing", tab=tab)
+    if configuration_errors and not refreshed:
+        return dashboard_redirect(configuration_errors[0][:120], tab=tab)
     if refreshed and (failed or blocked):
         message = f"Refreshed {refreshed} shipment(s). {blocked} blocked. {failed} failed. {skipped} skipped."
     elif refreshed:

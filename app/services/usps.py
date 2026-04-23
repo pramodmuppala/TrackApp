@@ -1,16 +1,80 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import json
+import re
+from datetime import datetime
 from typing import Any
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import RecipientProfile, Shipment, TrackingEvent, utcnow
 
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        SessionNotCreatedException,
+        TimeoutException,
+        WebDriverException,
+    )
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.remote.webdriver import WebDriver
+    from selenium.webdriver.safari.options import Options as SafariOptions
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+except ImportError:  # pragma: no cover - exercised via configuration tests
+    webdriver = None
+    WebDriver = Any
+    By = None
+    Keys = None
+    SafariOptions = None
+    WebDriverWait = None
+    EC = None
+
+    class NoSuchElementException(Exception):
+        pass
+
+    class SessionNotCreatedException(Exception):
+        pass
+
+    class TimeoutException(Exception):
+        pass
+
+    class WebDriverException(Exception):
+        pass
+
+
+TRACKING_INPUT_URL = "https://tools.usps.com/go/TrackConfirmAction_input"
+STATUS_KEYWORDS = (
+    "delivered",
+    "delivery attempted",
+    "out for delivery",
+    "in transit",
+    "arriving late",
+    "moving through network",
+    "arrived",
+    "departed",
+    "accepted",
+    "label created",
+    "pre-shipment",
+    "available for pickup",
+    "picked up",
+    "forwarded",
+    "return to sender",
+    "shipping partner",
+    "processed",
+)
+DATE_PATTERNS = (
+    "%B %d, %Y, %I:%M %p",
+    "%B %d, %Y %I:%M %p",
+    "%b %d, %Y, %I:%M %p",
+    "%b %d, %Y %I:%M %p",
+    "%B %d, %Y",
+    "%b %d, %Y",
+)
 settings = get_settings()
 
 
@@ -26,15 +90,6 @@ class USPSAccessRestrictedError(USPSRequestError):
     def __init__(self, message: str, payload: dict[str, Any] | None = None):
         super().__init__(message)
         self.payload = payload or {}
-
-
-@dataclass
-class OAuthToken:
-    access_token: str
-    expires_at: datetime
-
-
-_token_cache: OAuthToken | None = None
 
 
 def official_tracking_url(tracking_number: str) -> str:
@@ -57,95 +112,295 @@ def _first_non_empty(*values: Any) -> str | None:
     return None
 
 
-def _ensure_credentials() -> None:
-    if not settings.usps_client_id or not settings.usps_client_secret:
+def _require_selenium() -> None:
+    if webdriver is None or SafariOptions is None:
         raise USPSConfigurationError(
-            "USPS credentials are not configured. Add USPS_CLIENT_ID and USPS_CLIENT_SECRET to .env."
+            "Selenium is not installed. Run `pip install -r requirements.txt` to enable USPS web tracking."
         )
 
 
-def _extract_error_payload(response: httpx.Response) -> dict[str, Any]:
+def _build_driver() -> WebDriver:
+    _require_selenium()
     try:
-        data = response.json()
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
+        return webdriver.Safari(options=SafariOptions())
+    except SessionNotCreatedException as exc:
+        raise USPSConfigurationError(
+            "Safari remote automation is disabled. Enable Safari > Settings > Advanced > Show Develop menu, "
+            "then Develop > Allow Remote Automation."
+        ) from exc
+    except WebDriverException as exc:
+        raise USPSRequestError(f"Unable to start Safari WebDriver: {exc}") from exc
 
 
-def _extract_error_message(payload: dict[str, Any]) -> str | None:
-    error = payload.get("error")
-    if isinstance(error, dict):
-        message = error.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
+def _find_first(driver: WebDriver, selectors: list[str]):
+    last_error: Exception | None = None
+    for selector in selectors:
+        try:
+            return driver.find_element(By.CSS_SELECTOR, selector)
+        except NoSuchElementException as exc:
+            last_error = exc
+            continue
+    raise USPSRequestError(f"USPS page layout changed; could not find any of: {', '.join(selectors)}") from last_error
+
+
+def _clean_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _wait_for_results(driver: WebDriver, tracking_number: str) -> None:
+    def _results_ready(inner_driver: WebDriver) -> bool:
+        body_text = inner_driver.find_element(By.TAG_NAME, "body").text
+        lowered = body_text.lower()
+        if "allow remote automation" in lowered:
+            return True
+        if tracking_number in body_text and ("tracking" in lowered or "latest update" in lowered):
+            return True
+        if "tracking history" in lowered or "latest update" in lowered or "status not available" in lowered:
+            return True
+        return False
+
+    try:
+        WebDriverWait(driver, settings.usps_browser_timeout_seconds).until(_results_ready)
+    except TimeoutException as exc:
+        raise USPSRequestError("USPS tracking page did not finish loading in time.") from exc
+
+
+def _submit_tracking_number(driver: WebDriver, tracking_number: str) -> None:
+    driver.get(TRACKING_INPUT_URL)
+    tracking_input = _find_first(
+        driver,
+        [
+            "input[name='tLabels']",
+            "input[id*='tracking' i]",
+            "input[aria-label*='tracking' i]",
+            "input[placeholder*='tracking' i]",
+            "input[type='text']",
+        ],
+    )
+    tracking_input.clear()
+    tracking_input.send_keys(tracking_number)
+
+    try:
+        button = _find_first(
+            driver,
+            [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button[aria-label*='track' i]",
+                "button[id*='track' i]",
+            ],
+        )
+        button.click()
+    except USPSRequestError:
+        tracking_input.send_keys(Keys.ENTER)
+
+
+def _extract_json_candidates(page_source: str, tracking_number: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    script_blocks = re.findall(r"<script[^>]*>(.*?)</script>", page_source, flags=re.IGNORECASE | re.DOTALL)
+    for block in script_blocks:
+        if tracking_number not in block:
+            continue
+        for match in re.finditer(r"\{.*?\}", block, flags=re.DOTALL):
+            snippet = match.group(0)
+            if tracking_number not in snippet or '"tracking' not in snippet.lower():
+                continue
+            try:
+                data = json.loads(snippet)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                candidates.append(data)
+    return candidates
+
+
+def _walk_for_tracking_payload(obj: Any, tracking_number: str) -> dict[str, Any] | None:
+    if isinstance(obj, dict):
+        serialized = json.dumps(obj, default=str).lower()
+        if tracking_number.lower() in serialized and any(
+            key in serialized for key in ("trackingevents", "statussummary", "trackingnumber", "statuscategory")
+        ):
+            return obj
+        for value in obj.values():
+            found = _walk_for_tracking_payload(value, tracking_number)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _walk_for_tracking_payload(value, tracking_number)
+            if found:
+                return found
     return None
 
 
-def _get_token() -> str:
-    global _token_cache
-    _ensure_credentials()
+def _status_category(status: str | None) -> str | None:
+    lowered = (status or "").lower()
+    if not lowered:
+        return None
+    if "deliver" in lowered:
+        return "Delivered"
+    if "out for delivery" in lowered:
+        return "Out for Delivery"
+    if any(term in lowered for term in ("in transit", "arriving late", "moving through network", "departed")):
+        return "In Transit"
+    if any(term in lowered for term in ("accepted", "arrived", "processed", "shipping partner")):
+        return "Accepted"
+    if any(term in lowered for term in ("label created", "pre-shipment")):
+        return "Pre-Shipment"
+    if "pickup" in lowered:
+        return "Pickup"
+    if "return" in lowered:
+        return "Return"
+    return "Tracking"
 
-    if _token_cache and _token_cache.expires_at > utcnow() + timedelta(seconds=60):
-        return _token_cache.access_token
 
-    url = f"{settings.usps_base_url.rstrip('/')}{settings.usps_oauth_path}"
-    payload = {
-        "client_id": settings.usps_client_id,
-        "client_secret": settings.usps_client_secret,
-        "grant_type": "client_credentials",
+def _extract_status(lines: list[str]) -> str | None:
+    for index, line in enumerate(lines):
+        if line.lower() == "latest update" and index + 1 < len(lines):
+            return lines[index + 1]
+    for line in lines:
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in STATUS_KEYWORDS):
+            return line
+    return None
+
+
+def _extract_summary(lines: list[str], status: str | None) -> str | None:
+    if not status:
+        return None
+    for index, line in enumerate(lines):
+        if line == status and index + 1 < len(lines):
+            next_line = lines[index + 1]
+            if next_line != status and tracking_number_like(next_line) is False:
+                return next_line
+    return status
+
+
+def tracking_number_like(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value)
+    return compact.isalnum() and 8 <= len(compact) <= 34
+
+
+def _parse_event_datetime(value: str) -> datetime | None:
+    cleaned = re.sub(r"\s+at\s+", " ", value, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,")
+    for pattern in DATE_PATTERNS:
+        try:
+            return datetime.strptime(cleaned, pattern)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_events(lines: list[str]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        event_dt = _parse_event_datetime(line)
+        if not event_dt:
+            continue
+        description_parts: list[str] = []
+        for follower in lines[index + 1 : index + 4]:
+            if _parse_event_datetime(follower):
+                break
+            if follower.lower() in {"tracking history", "latest update", "product information"}:
+                break
+            description_parts.append(follower)
+        description = " ".join(description_parts).strip() or "Tracking update"
+        event_type = description_parts[0] if description_parts else "Tracking update"
+        events.append(
+            {
+                "eventTimestamp": event_dt.isoformat(),
+                "eventType": event_type,
+                "eventCode": event_type.lower().replace(" ", "_")[:40],
+                "eventDescription": description,
+                "rawText": [line, *description_parts],
+            }
+        )
+    return events
+
+
+def _payload_from_text(body_text: str, tracking_number: str) -> dict[str, Any]:
+    lines = _clean_lines(body_text)
+    status = _extract_status(lines)
+    summary = _extract_summary(lines, status)
+    events = _extract_events(lines)
+    if not events and status:
+        events = [
+            {
+                "eventTimestamp": utcnow().isoformat(),
+                "eventType": status,
+                "eventCode": status.lower().replace(" ", "_")[:40],
+                "eventDescription": summary or status,
+                "rawText": [status, summary] if summary else [status],
+            }
+        ]
+
+    return {
+        "trackingNumber": tracking_number,
+        "status": status or "Tracking details available on USPS website",
+        "statusCategory": _status_category(status),
+        "statusSummary": summary or status or "USPS tracking details loaded from website",
+        "trackingEvents": events,
+        "rawText": lines,
+        "source": "usps_web_tracking",
     }
-    with httpx.Client(timeout=20.0) as client:
-        response = client.post(url, json=payload, headers={"Content-Type": "application/json"})
-    if response.status_code >= 400:
-        raise USPSRequestError(f"USPS OAuth failed: {response.status_code} {response.text[:300]}")
 
-    data = response.json()
-    expires_in = int(data.get("expires_in", "300"))
-    _token_cache = OAuthToken(
-        access_token=data["access_token"],
-        expires_at=utcnow() + timedelta(seconds=expires_in),
-    )
-    return _token_cache.access_token
+
+def _normalize_payload(payload: dict[str, Any], tracking_number: str, body_text: str) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized.setdefault("trackingNumber", tracking_number)
+    normalized.setdefault("status", _extract_status(_clean_lines(body_text)))
+    normalized.setdefault("statusCategory", _status_category(normalized.get("status")))
+    normalized.setdefault("statusSummary", normalized.get("status"))
+    normalized.setdefault("trackingEvents", [])
+    normalized["source"] = "usps_web_tracking"
+    normalized["rawText"] = _clean_lines(body_text)
+    return normalized
 
 
 def fetch_tracking_detail(tracking_number: str) -> dict[str, Any]:
-    token = _get_token()
-    path = settings.usps_tracking_path_template.format(tracking_number=tracking_number)
-    url = f"{settings.usps_base_url.rstrip('/')}{path}"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    params = {"expand": "DETAIL"}
-    with httpx.Client(timeout=25.0) as client:
-        response = client.get(url, headers=headers, params=params)
-    if response.status_code >= 400:
-        error_payload = _extract_error_payload(response)
-        error_message = _extract_error_message(error_payload)
-        if response.status_code == 403 and error_message:
-            lowered = error_message.lower()
-            if "not authorized to access" in lowered or "access controls" in lowered or "ip agreement" in lowered:
-                raise USPSAccessRestrictedError(
-                    "USPS access restricted for this tracking number. Submit the USPS IP Agreement inquiry to re-enable API tracking.",
-                    payload=error_payload,
-                )
-        detail = error_message or response.text[:400]
-        raise USPSRequestError(f"USPS tracking failed: {response.status_code} {detail[:400]}")
-    data = response.json()
-    if not isinstance(data, dict):
-        raise USPSRequestError("Unexpected USPS tracking response shape.")
-    return data
+    driver: WebDriver | None = None
+    try:
+        driver = _build_driver()
+        _submit_tracking_number(driver, tracking_number)
+        _wait_for_results(driver, tracking_number)
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        lowered = body_text.lower()
+        if "access denied" in lowered or "forbidden" in lowered:
+            raise USPSAccessRestrictedError(
+                "USPS blocked the tracking page request in the browser session.",
+                payload={"bodyText": body_text},
+            )
+
+        for candidate in _extract_json_candidates(driver.page_source, tracking_number):
+            payload = _walk_for_tracking_payload(candidate, tracking_number)
+            if payload:
+                return _normalize_payload(payload, tracking_number, body_text)
+
+        return _payload_from_text(body_text, tracking_number)
+    except USPSConfigurationError:
+        raise
+    except USPSRequestError:
+        raise
+    except USPSAccessRestrictedError:
+        raise
+    except Exception as exc:
+        raise USPSRequestError(f"USPS web tracking failed: {exc}") from exc
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def _mark_access_restricted(shipment: Shipment, exc: USPSAccessRestrictedError) -> None:
     shipment.official_tracking_url = official_tracking_url(shipment.tracking_number)
     shipment.last_synced_at = utcnow()
-    shipment.status = "USPS access restricted"
+    shipment.status = "USPS page blocked"
     shipment.status_category = "Authorization"
     shipment.status_summary = str(exc)
-    shipment.latest_payload = exc.payload or {
-        "error": {
-            "code": "403",
-            "message": str(exc),
-        }
-    }
+    shipment.latest_payload = exc.payload or {"error": {"message": str(exc)}}
 
 
 def _derive_recipient_data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -172,7 +427,7 @@ def _derive_recipient_data(payload: dict[str, Any]) -> dict[str, Any]:
         "state": state,
         "postal_code": postal_code,
         "country": country,
-        "source": "usps_tracking",
+        "source": "usps_web_tracking",
         "raw_profile": {
             "display_name": display_name,
             "company": company,
@@ -207,6 +462,7 @@ def sync_shipment_tracking(db: Session, shipment: Shipment) -> Shipment:
         db.add(shipment)
         db.flush()
         raise
+
     shipment.official_tracking_url = official_tracking_url(shipment.tracking_number)
     shipment.latest_payload = payload
     shipment.last_synced_at = utcnow()
